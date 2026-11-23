@@ -1,41 +1,66 @@
 // Burakhan Yılmaz, 2200005240
 import bcrypt from "bcryptjs";
 import type { MiddlewareHandler } from "hono";
-import type { Db } from "./db.ts";
+import { jwtVerify, SignJWT } from "jose";
 
-export type Env = { Variables: { userId: number } };
+export type Role = "user" | "admin";
+
+export type Env = {
+  Variables: {
+    userId: number;
+    role: Role;
+    requestId: string;
+  };
+};
 
 export const hashPassword = (plain: string) => bcrypt.hash(plain, 10);
 export const checkPassword = (plain: string, hash: string) => bcrypt.compare(plain, hash);
 
-const SESSION_SECONDS = 60 * 60;
+const encodeSecret = (secret?: string) =>
+  new TextEncoder().encode(secret ?? Deno.env.get("JWT_SECRET") ?? "dev-secret");
 
-export async function createSession(db: Db, userId: number): Promise<string> {
-  const token = crypto.randomUUID();
-  await db.client.execute({
-    sql:
-      "INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, strftime('%s','now') + ?)",
-    args: [token, userId, SESSION_SECONDS],
-  });
-  return token;
+export function signToken(
+  userId: number,
+  role: Role = "user",
+  options?: { secret?: string; expiresIn?: string },
+): Promise<string> {
+  return new SignJWT({ role })
+    .setProtectedHeader({ alg: "HS256" })
+    .setSubject(String(userId))
+    .setExpirationTime(options?.expiresIn ?? "1h")
+    .sign(encodeSecret(options?.secret));
 }
 
-export async function userIdFromToken(db: Db, token: string): Promise<number | null> {
-  const res = await db.client.execute({
-    sql:
-      "SELECT user_id FROM sessions WHERE token = ? AND expires_at > strftime('%s','now')",
-    args: [token],
-  });
-  const id = res.rows[0]?.user_id;
-  return id === undefined ? null : Number(id);
+export async function verifyToken(
+  token: string,
+  secretOverride?: string,
+): Promise<{ userId: number; role: Role } | null> {
+  try {
+    const { payload } = await jwtVerify(token, encodeSecret(secretOverride));
+    const userId = Number(payload.sub);
+    const role = payload.role === "admin" ? "admin" : "user";
+    if (!Number.isInteger(userId) || userId <= 0) return null;
+    return { userId, role };
+  } catch {
+    return null;
+  }
 }
 
-export const requireAuth = (db: Db): MiddlewareHandler<Env> => async (c, next) => {
+export const requireAuth = (): MiddlewareHandler<Env> => async (c, next) => {
   const header = c.req.header("authorization") ?? "";
   const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
   if (!token) return c.json({ error: "unauthorized" }, 401);
-  const id = await userIdFromToken(db, token);
-  if (id === null) return c.json({ error: "unauthorized" }, 401);
-  c.set("userId", id);
+  const verified = await verifyToken(token);
+  if (verified === null) return c.json({ error: "unauthorized" }, 401);
+  c.set("userId", verified.userId);
+  c.set("role", verified.role);
   await next();
 };
+
+export const requireRole =
+  (...roles: Role[]): MiddlewareHandler<Env> => async (c, next) => {
+    const role = c.get("role");
+    if (!role) return c.json({ error: "unauthenticated" }, 401);
+    if (!roles.includes(role)) return c.json({ error: "forbidden" }, 403);
+    await next();
+  };

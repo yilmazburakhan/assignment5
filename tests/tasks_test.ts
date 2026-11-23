@@ -155,5 +155,7 @@ Deno.test("unknown route returns unified 404 error shape", async () => {
   const app = await freshApp();
   const res = await app.request("/does-not-exist");
   assertEquals(res.status, 404);
-  assertEquals(await res.json(), { error: "not found" });
+  const body = await res.json();
+  assertEquals(body.error, "not found");
+  assertExists(body.requestId);
 });
