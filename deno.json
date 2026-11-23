@@ -3,11 +3,12 @@
     "dev": "deno run -A --watch src/main.ts",
     "start": "deno run -A src/main.ts",
     "test": "deno test -A",
-    "check": "deno check src/*.ts tests/*.ts",
+    "check": "deno check src/*.ts tests/*.ts scripts/*.ts",
     "fmt": "deno fmt",
     "lint": "deno lint",
     "db:generate": "deno run -A npm:drizzle-kit generate",
     "db:migrate": "deno run -A npm:drizzle-kit migrate",
+    "seed": "deno run -A scripts/seed.ts",
     "ui:install": "cd ui && deno install",
     "ui:dev": "cd ui && deno task dev"
   },
