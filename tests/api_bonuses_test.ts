@@ -10,7 +10,9 @@ Deno.test("JWT rejects tampered, expired, and wrong-secret tokens with 401", asy
   const app = await freshApp();
   const validToken = await registerAndLogin(app, "jwt@example.com");
 
-  const tampered = validToken.slice(0, -1) + (validToken.endsWith("a") ? "b" : "a");
+  const [header, payload, signature] = validToken.split(".");
+  const tamperedSig = (signature[0] === "a" ? "b" : "a") + signature.slice(1);
+  const tampered = `${header}.${payload}.${tamperedSig}`;
   const tamperedRes = await app.request("/api/tasks", {
     headers: { authorization: `Bearer ${tampered}` },
   });
