@@ -1,13 +1,15 @@
-// STUDENT NAME, STUDENT NUMBER
+// Burakhan Yılmaz, 2200005240
 import bcrypt from "bcryptjs";
+import type { MiddlewareHandler } from "hono";
 import type { Db } from "./db.ts";
+
+export type Env = { Variables: { userId: number } };
 
 export const hashPassword = (plain: string) => bcrypt.hash(plain, 10);
 export const checkPassword = (plain: string, hash: string) => bcrypt.compare(plain, hash);
 
-const SESSION_SECONDS = 60 * 60; // a session lives for one hour
+const SESSION_SECONDS = 60 * 60;
 
-/** Log a user in: store a random token for them and return it. */
 export async function createSession(db: Db, userId: number): Promise<string> {
   const token = crypto.randomUUID();
   await db.client.execute({
@@ -18,7 +20,6 @@ export async function createSession(db: Db, userId: number): Promise<string> {
   return token;
 }
 
-/** Return the user id that owns a valid, unexpired token, or null. */
 export async function userIdFromToken(db: Db, token: string): Promise<number | null> {
   const res = await db.client.execute({
     sql:
@@ -29,6 +30,12 @@ export async function userIdFromToken(db: Db, token: string): Promise<number | n
   return id === undefined ? null : Number(id);
 }
 
-// TODO R3: write a Hono middleware factory `requireAuth(db)` that reads "Authorization: Bearer <token>",
-// answers 401 when it is missing or unknown (use userIdFromToken), and otherwise stores the
-// user id with c.set("userId", id) so that the routes can use it.
+export const requireAuth = (db: Db): MiddlewareHandler<Env> => async (c, next) => {
+  const header = c.req.header("authorization") ?? "";
+  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+  if (!token) return c.json({ error: "unauthorized" }, 401);
+  const id = await userIdFromToken(db, token);
+  if (id === null) return c.json({ error: "unauthorized" }, 401);
+  c.set("userId", id);
+  await next();
+};

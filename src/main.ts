@@ -1,4 +1,4 @@
-// STUDENT NAME, STUDENT NUMBER
+// Burakhan Yılmaz, 2200005240
 import { createApp } from "./app.ts";
 import { createDb, migrate } from "./db.ts";
 
