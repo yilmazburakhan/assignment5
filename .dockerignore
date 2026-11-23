@@ -1,0 +1,12 @@
+.git
+.github
+.env
+.env.*
+ui
+tests
+scripts
+uploads
+node_modules
+*.db
+*.db-shm
+*.db-wal

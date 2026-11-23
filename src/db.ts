@@ -6,8 +6,8 @@ import * as schema from "./schema.ts";
 
 export type Db = ReturnType<typeof createDb>;
 
-export function createDb(url: string) {
-  const client = createClient({ url });
+export function createDb(url: string, authToken?: string) {
+  const client = createClient(authToken ? { url, authToken } : { url });
   const db = drizzle(client, { schema });
   return { db, client };
 }
