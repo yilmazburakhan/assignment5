@@ -1,10 +1,10 @@
 // Burakhan Yılmaz, 2200005240
+import { createTaskRequest, freshApp, registerAndLogin } from "./helpers.ts";
 import { assertEquals, assertExists, assertThrows } from "@std/assert";
 import { createApp } from "../src/app.ts";
 import { signToken } from "../src/auth.ts";
 import { loadConfig } from "../src/config.ts";
 import { createDb, migrate } from "../src/db.ts";
-import { freshApp, registerAndLogin } from "./helpers.ts";
 
 Deno.test("JWT rejects tampered, expired, and wrong-secret tokens with 401", async () => {
   const app = await freshApp();
@@ -101,4 +101,86 @@ Deno.test("loadConfig refuses invalid PORT and default dev-secret in production"
     JWT_SECRET: "strong-secret-key",
   });
   assertEquals(validProd.PORT, 9000);
+});
+Deno.test("OpenAPI serves /openapi.json with routes and Bearer scheme, plus /docs", async () => {
+  const app = await freshApp();
+
+  const specRes = await app.request("/openapi.json");
+  assertEquals(specRes.status, 200);
+  const spec = await specRes.json();
+  assertEquals(spec.openapi, "3.0.0");
+  assertExists(spec.components.securitySchemes.Bearer);
+  assertExists(spec.paths["/auth/register"]);
+  assertExists(spec.paths["/auth/login"]);
+  assertExists(spec.paths["/api/tasks"]);
+  assertExists(spec.paths["/api/tasks/{id}"]);
+  assertExists(spec.paths["/api/tasks/{id}/attachment"]);
+
+  const docsRes = await app.request("/docs");
+  assertEquals(docsRes.status, 200);
+  const html = await docsRes.text();
+  assertEquals(html.includes("/openapi.json"), true);
+});
+
+Deno.test("attachment upload validates file/size/type (400/413/415) and serves only to owner", async () => {
+  const app = await freshApp();
+  const tokenA = await registerAndLogin(app, "upload-a@example.com");
+  const tokenB = await registerAndLogin(app, "upload-b@example.com");
+
+  const taskRes = await createTaskRequest(app, tokenA, { title: "With image" });
+  const task = await taskRes.json();
+
+  const emptyForm = new FormData();
+  const missingFile = await app.request(`/api/tasks/${task.id}/attachment`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${tokenA}` },
+    body: emptyForm,
+  });
+  assertEquals(missingFile.status, 400);
+
+  const bigForm = new FormData();
+  bigForm.append(
+    "file",
+    new File([new Uint8Array(1_000_001)], "big.png", { type: "image/png" }),
+  );
+  const tooLarge = await app.request(`/api/tasks/${task.id}/attachment`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${tokenA}` },
+    body: bigForm,
+  });
+  assertEquals(tooLarge.status, 413);
+
+  const txtForm = new FormData();
+  txtForm.append("file", new File(["hello"], "note.txt", { type: "text/plain" }));
+  const badType = await app.request(`/api/tasks/${task.id}/attachment`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${tokenA}` },
+    body: txtForm,
+  });
+  assertEquals(badType.status, 415);
+
+  const pngBytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const goodForm = new FormData();
+  goodForm.append("file", new File([pngBytes], "a.png", { type: "image/png" }));
+  const uploadOk = await app.request(`/api/tasks/${task.id}/attachment`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${tokenA}` },
+    body: goodForm,
+  });
+  assertEquals(uploadOk.status, 200);
+  const updatedTask = await uploadOk.json();
+  assertExists(updatedTask.attachment);
+  assertEquals(updatedTask.attachment === "a.png", false);
+
+  const downloadOk = await app.request(`/api/tasks/${task.id}/attachment`, {
+    headers: { authorization: `Bearer ${tokenA}` },
+  });
+  assertEquals(downloadOk.status, 200);
+  assertEquals(downloadOk.headers.get("content-type"), "image/png");
+  assertEquals(new Uint8Array(await downloadOk.arrayBuffer()), pngBytes);
+
+  const downloadOther = await app.request(`/api/tasks/${task.id}/attachment`, {
+    headers: { authorization: `Bearer ${tokenB}` },
+  });
+  assertEquals(downloadOther.status, 404);
 });

@@ -4,9 +4,10 @@ import { createDb, migrate } from "../src/db.ts";
 
 export async function freshApp() {
   const file = await Deno.makeTempFile({ suffix: ".db" });
+  const uploadsDir = await Deno.makeTempDir({ prefix: "uploads-" });
   const db = createDb(`file:${file}`);
   await migrate(db);
-  return createApp(db);
+  return createApp(db, undefined, uploadsDir);
 }
 
 export async function registerAndLogin(
