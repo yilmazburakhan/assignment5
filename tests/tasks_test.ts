@@ -107,7 +107,6 @@ Deno.test("pagination returns page 2 with correct items and total", async () => 
   const app = await freshApp();
   const token = await registerAndLogin(app, "page@example.com");
 
-  await createTaskRequest(app, token, { title: "Task 1" });
   await createTaskRequest(app, token, { title: "Task 2" });
   await createTaskRequest(app, token, { title: "Task 3" });
 

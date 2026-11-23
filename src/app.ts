@@ -1,6 +1,6 @@
 // Burakhan Yılmaz, 2200005240
 import { Hono } from "hono";
-import { and, count, eq } from "drizzle-orm";
+import { and, count, eq, isNotNull, isNull } from "drizzle-orm";
 import { z } from "zod";
 import type { Db } from "./db.ts";
 import { tasks, users } from "./schema.ts";
@@ -11,6 +11,7 @@ import {
   hashPassword,
   requireAuth,
 } from "./auth.ts";
+import { Pool } from "./pool.ts";
 
 const CredentialsSchema = z.object({
   email: z.email(),
@@ -34,8 +35,32 @@ function parseId(raw: string): number | null {
   return Number.isInteger(n) && n > 0 ? n : null;
 }
 
-export function createApp(dbConn: Db) {
+export async function registerUserInTx(
+  dbConn: Db,
+  email: string,
+  passwordHash: string,
+  beforeWelcome?: () => void,
+) {
+  return await dbConn.db.transaction(async (tx) => {
+    const [created] = await tx
+      .insert(users)
+      .values({ email, passwordHash })
+      .returning({ id: users.id, email: users.email });
+    if (!created) throw new Error("failed to create user");
+    beforeWelcome?.();
+    await tx.insert(tasks).values({
+      userId: created.id,
+      title: "Welcome!",
+      status: "todo",
+      priority: "medium",
+    });
+    return created;
+  });
+}
+
+export function createApp(dbConn: Db, pool?: Pool<Db>) {
   const { db } = dbConn;
+  const activePool = pool ?? new Pool([dbConn]);
   const app = new Hono<Env>();
 
   app.get("/health", (c) => c.json({ ok: true }));
@@ -57,10 +82,7 @@ export function createApp(dbConn: Db) {
     }
 
     const passwordHash = await hashPassword(password);
-    const [created] = await db
-      .insert(users)
-      .values({ email, passwordHash })
-      .returning({ id: users.id, email: users.email });
+    const created = await registerUserInTx(dbConn, email, passwordHash);
 
     return c.json(created, 201);
   });
@@ -84,8 +106,29 @@ export function createApp(dbConn: Db) {
 
   app.use("/api/*", requireAuth(dbConn));
 
-  const own = (id: number, userId: number) =>
-    and(eq(tasks.id, id), eq(tasks.userId, userId));
+  const ownActive = (id: number, userId: number) =>
+    and(eq(tasks.id, id), eq(tasks.userId, userId), isNull(tasks.deletedAt));
+
+  app.get("/api/me/summary", async (c) => {
+    const userId = c.get("userId");
+    const rows = await activePool.use(({ db: pooledDb }) =>
+      pooledDb
+        .select({ status: tasks.status, n: count() })
+        .from(tasks)
+        .where(and(eq(tasks.userId, userId), isNull(tasks.deletedAt)))
+        .groupBy(tasks.status)
+    );
+
+    const summary: Record<"todo" | "in-progress" | "done", number> = {
+      todo: 0,
+      "in-progress": 0,
+      done: 0,
+    };
+    for (const row of rows) {
+      summary[row.status] = row.n;
+    }
+    return c.json(summary, 200);
+  });
 
   app.get("/api/tasks", async (c) => {
     const parsed = TaskQuerySchema.safeParse(c.req.query());
@@ -96,20 +139,24 @@ export function createApp(dbConn: Db) {
     const { page, limit, status } = parsed.data;
     const userId = c.get("userId");
     const condition = status
-      ? and(eq(tasks.userId, userId), eq(tasks.status, status))
-      : eq(tasks.userId, userId);
+      ? and(eq(tasks.userId, userId), eq(tasks.status, status), isNull(tasks.deletedAt))
+      : and(eq(tasks.userId, userId), isNull(tasks.deletedAt));
 
-    const items = await db
-      .select()
-      .from(tasks)
-      .where(condition)
-      .limit(limit)
-      .offset((page - 1) * limit);
+    const result = await activePool.use(async ({ db: pooledDb }) => {
+      const items = await pooledDb
+        .select()
+        .from(tasks)
+        .where(condition)
+        .limit(limit)
+        .offset((page - 1) * limit);
 
-    const [row] = await db.select({ total: count() }).from(tasks).where(condition);
-    const total = row?.total ?? 0;
+      const [row] = await pooledDb.select({ total: count() }).from(tasks).where(
+        condition,
+      );
+      return { items, total: row?.total ?? 0 };
+    });
 
-    return c.json({ items, page, limit, total }, 200);
+    return c.json({ items: result.items, page, limit, total: result.total }, 200);
   });
 
   app.post("/api/tasks", async (c) => {
@@ -120,10 +167,12 @@ export function createApp(dbConn: Db) {
     }
 
     const userId = c.get("userId");
-    const [created] = await db
-      .insert(tasks)
-      .values({ ...parsed.data, userId })
-      .returning();
+    const [created] = await activePool.use(({ db: pooledDb }) =>
+      pooledDb
+        .insert(tasks)
+        .values({ ...parsed.data, userId })
+        .returning()
+    );
 
     return c.json(created, 201);
   });
@@ -132,10 +181,12 @@ export function createApp(dbConn: Db) {
     const id = parseId(c.req.param("id"));
     if (id === null) return c.json({ error: "not found" }, 404);
 
-    const [task] = await db
-      .select()
-      .from(tasks)
-      .where(own(id, c.get("userId")));
+    const [task] = await activePool.use(({ db: pooledDb }) =>
+      pooledDb
+        .select()
+        .from(tasks)
+        .where(ownActive(id, c.get("userId")))
+    );
 
     return task ? c.json(task, 200) : c.json({ error: "not found" }, 404);
   });
@@ -150,11 +201,13 @@ export function createApp(dbConn: Db) {
       return c.json({ error: "validation failed", issues: parsed.error.issues }, 400);
     }
 
-    const [updated] = await db
-      .update(tasks)
-      .set(parsed.data)
-      .where(own(id, c.get("userId")))
-      .returning();
+    const [updated] = await activePool.use(({ db: pooledDb }) =>
+      pooledDb
+        .update(tasks)
+        .set(parsed.data)
+        .where(ownActive(id, c.get("userId")))
+        .returning()
+    );
 
     return updated ? c.json(updated, 200) : c.json({ error: "not found" }, 404);
   });
@@ -163,12 +216,37 @@ export function createApp(dbConn: Db) {
     const id = parseId(c.req.param("id"));
     if (id === null) return c.json({ error: "not found" }, 404);
 
-    const [deleted] = await db
-      .delete(tasks)
-      .where(own(id, c.get("userId")))
-      .returning({ id: tasks.id });
+    const now = Math.floor(Date.now() / 1000);
+    const [deleted] = await activePool.use(({ db: pooledDb }) =>
+      pooledDb
+        .update(tasks)
+        .set({ deletedAt: now })
+        .where(ownActive(id, c.get("userId")))
+        .returning({ id: tasks.id })
+    );
 
     return deleted ? c.json({ ok: true }, 200) : c.json({ error: "not found" }, 404);
+  });
+
+  app.post("/api/tasks/:id/restore", async (c) => {
+    const id = parseId(c.req.param("id"));
+    if (id === null) return c.json({ error: "not found" }, 404);
+
+    const [restored] = await activePool.use(({ db: pooledDb }) =>
+      pooledDb
+        .update(tasks)
+        .set({ deletedAt: null })
+        .where(
+          and(
+            eq(tasks.id, id),
+            eq(tasks.userId, c.get("userId")),
+            isNotNull(tasks.deletedAt),
+          ),
+        )
+        .returning()
+    );
+
+    return restored ? c.json(restored, 200) : c.json({ error: "not found" }, 404);
   });
 
   app.notFound((c) => c.json({ error: "not found" }, 404));
