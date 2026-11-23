@@ -1,4 +1,4 @@
-// STUDENT NAME, STUDENT NUMBER
+// Burakhan Yılmaz, 2200005240
 import { assertEquals } from "@std/assert";
 import { freshApp } from "./helpers.ts";
 
