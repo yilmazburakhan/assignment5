@@ -11,7 +11,9 @@ import {
   requireRole,
   type Role,
   signToken,
+  verifyToken,
 } from "./auth.ts";
+import { LoginRateLimiter, WsHub } from "./live.ts";
 import { Pool } from "./pool.ts";
 
 const ErrorSchema = z.object({
@@ -95,6 +97,7 @@ const ALLOWED_IMAGE_TYPES: Record<string, string> = {
 };
 
 const MAX_ATTACHMENT_BYTES = 1_000_000;
+const TASK_CACHE_TTL_MS = 60_000;
 
 function parseId(raw: string): number | null {
   const n = Number(raw);
@@ -147,9 +150,16 @@ export async function registerUserInTx(
   });
 }
 
-export function createApp(dbConn: Db, pool?: Pool<Db>, uploadsDir = "./uploads") {
+export function createApp(
+  dbConn: Db,
+  pool?: Pool<Db>,
+  uploadsDir = "./uploads",
+  kv?: Deno.Kv,
+) {
   const { db } = dbConn;
   const activePool = pool ?? new Pool([dbConn]);
+  const wsHub = new WsHub();
+  const rateLimiter = new LoginRateLimiter();
 
   const app = new OpenAPIHono<Env>({
     defaultHook: (result, c) => {
@@ -183,6 +193,16 @@ export function createApp(dbConn: Db, pool?: Pool<Db>, uploadsDir = "./uploads")
         ms: Math.round(performance.now() - start),
       }),
     );
+  });
+
+  app.get("/ws", async (c) => {
+    const token = c.req.query("token") ?? "";
+    const verified = await verifyToken(token);
+    if (verified === null) return c.json({ error: "unauthorized" }, 401);
+    const { socket, response } = Deno.upgradeWebSocket(c.req.raw);
+    socket.onopen = () => wsHub.add(verified.userId, socket);
+    socket.onclose = () => wsHub.remove(verified.userId, socket);
+    return response;
   });
 
   const healthRoute = createRoute({
@@ -294,15 +314,28 @@ export function createApp(dbConn: Db, pool?: Pool<Db>, uploadsDir = "./uploads")
         content: { "application/json": { schema: ErrorSchema } },
         description: "Invalid email or password",
       },
+      429: {
+        content: { "application/json": { schema: ErrorSchema } },
+        description: "Too many login attempts",
+      },
     },
   });
   app.openapi(loginRoute, async (c) => {
     const { email, password } = c.req.valid("json");
+
+    const retryAfter = rateLimiter.retryAfterSeconds(email);
+    if (retryAfter !== null) {
+      c.header("Retry-After", String(retryAfter));
+      return c.json({ error: "too many login attempts" }, 429);
+    }
+
     const [user] = await db.select().from(users).where(eq(users.email, email));
     if (!user || !(await checkPassword(password, user.passwordHash))) {
+      rateLimiter.recordFailure(email);
       return c.json({ error: "invalid email or password" }, 401);
     }
 
+    rateLimiter.clear(email);
     const token = await signToken(user.id, user.role);
     return c.json({ token }, 200);
   });
@@ -461,6 +494,7 @@ export function createApp(dbConn: Db, pool?: Pool<Db>, uploadsDir = "./uploads")
         .returning()
     );
 
+    wsHub.broadcast(userId, { type: "task.created", task: created });
     return c.json(created, 201);
   });
 
@@ -488,14 +522,24 @@ export function createApp(dbConn: Db, pool?: Pool<Db>, uploadsDir = "./uploads")
     const id = parseId(c.req.valid("param").id);
     if (id === null) return c.json({ error: "not found" }, 404);
 
+    const userId = c.get("userId");
+    if (kv) {
+      const hit = await kv.get<typeof tasks.$inferSelect>(["task", userId, id]);
+      if (hit.value) return c.json(hit.value, 200);
+    }
+
     const [task] = await activePool.use(({ db: pooledDb }) =>
       pooledDb
         .select()
         .from(tasks)
-        .where(ownActive(id, c.get("userId")))
+        .where(ownActive(id, userId))
     );
+    if (!task) return c.json({ error: "not found" }, 404);
 
-    return task ? c.json(task, 200) : c.json({ error: "not found" }, 404);
+    if (kv) {
+      await kv.set(["task", userId, id], task, { expireIn: TASK_CACHE_TTL_MS });
+    }
+    return c.json(task, 200);
   });
 
   const updateTaskRoute = createRoute({
@@ -531,16 +575,20 @@ export function createApp(dbConn: Db, pool?: Pool<Db>, uploadsDir = "./uploads")
     const id = parseId(c.req.valid("param").id);
     if (id === null) return c.json({ error: "not found" }, 404);
 
+    const userId = c.get("userId");
     const data = c.req.valid("json");
     const [updated] = await activePool.use(({ db: pooledDb }) =>
       pooledDb
         .update(tasks)
         .set(data)
-        .where(ownActive(id, c.get("userId")))
+        .where(ownActive(id, userId))
         .returning()
     );
+    if (!updated) return c.json({ error: "not found" }, 404);
 
-    return updated ? c.json(updated, 200) : c.json({ error: "not found" }, 404);
+    if (kv) await kv.delete(["task", userId, id]);
+    wsHub.broadcast(userId, { type: "task.updated", task: updated });
+    return c.json(updated, 200);
   });
 
   const deleteTaskRoute = createRoute({
@@ -567,16 +615,20 @@ export function createApp(dbConn: Db, pool?: Pool<Db>, uploadsDir = "./uploads")
     const id = parseId(c.req.valid("param").id);
     if (id === null) return c.json({ error: "not found" }, 404);
 
+    const userId = c.get("userId");
     const now = Math.floor(Date.now() / 1000);
     const [deleted] = await activePool.use(({ db: pooledDb }) =>
       pooledDb
         .update(tasks)
         .set({ deletedAt: now })
-        .where(ownActive(id, c.get("userId")))
+        .where(ownActive(id, userId))
         .returning({ id: tasks.id })
     );
+    if (!deleted) return c.json({ error: "not found" }, 404);
 
-    return deleted ? c.json({ ok: true }, 200) : c.json({ error: "not found" }, 404);
+    if (kv) await kv.delete(["task", userId, id]);
+    wsHub.broadcast(userId, { type: "task.deleted", task: deleted });
+    return c.json({ ok: true }, 200);
   });
 
   const restoreTaskRoute = createRoute({
@@ -603,6 +655,7 @@ export function createApp(dbConn: Db, pool?: Pool<Db>, uploadsDir = "./uploads")
     const id = parseId(c.req.valid("param").id);
     if (id === null) return c.json({ error: "not found" }, 404);
 
+    const userId = c.get("userId");
     const [restored] = await activePool.use(({ db: pooledDb }) =>
       pooledDb
         .update(tasks)
@@ -610,14 +663,17 @@ export function createApp(dbConn: Db, pool?: Pool<Db>, uploadsDir = "./uploads")
         .where(
           and(
             eq(tasks.id, id),
-            eq(tasks.userId, c.get("userId")),
+            eq(tasks.userId, userId),
             isNotNull(tasks.deletedAt),
           ),
         )
         .returning()
     );
+    if (!restored) return c.json({ error: "not found" }, 404);
 
-    return restored ? c.json(restored, 200) : c.json({ error: "not found" }, 404);
+    if (kv) await kv.delete(["task", userId, id]);
+    wsHub.broadcast(userId, { type: "task.restored", task: restored });
+    return c.json(restored, 200);
   });
 
   const uploadAttachmentRoute = createRoute({
@@ -656,11 +712,12 @@ export function createApp(dbConn: Db, pool?: Pool<Db>, uploadsDir = "./uploads")
     const id = parseId(c.req.valid("param").id);
     if (id === null) return c.json({ error: "not found" }, 404);
 
+    const userId = c.get("userId");
     const [task] = await activePool.use(({ db: pooledDb }) =>
       pooledDb
         .select()
         .from(tasks)
-        .where(ownActive(id, c.get("userId")))
+        .where(ownActive(id, userId))
     );
     if (!task) return c.json({ error: "not found" }, 404);
 
@@ -686,10 +743,11 @@ export function createApp(dbConn: Db, pool?: Pool<Db>, uploadsDir = "./uploads")
       pooledDb
         .update(tasks)
         .set({ attachment: storedName })
-        .where(ownActive(id, c.get("userId")))
+        .where(ownActive(id, userId))
         .returning()
     );
 
+    if (kv) await kv.delete(["task", userId, id]);
     return c.json(updated, 200);
   });
 

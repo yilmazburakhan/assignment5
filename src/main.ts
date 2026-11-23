@@ -2,6 +2,7 @@
 import { createApp } from "./app.ts";
 import { loadConfig } from "./config.ts";
 import { createDb, migrate } from "./db.ts";
+import { purgeOldDone } from "./jobs.ts";
 import { createSqlitePool } from "./pool.ts";
 
 const config = loadConfig();
@@ -12,4 +13,11 @@ const pool = config.DATABASE_URL.startsWith("file:")
   ? await createSqlitePool(config.DATABASE_URL, 3)
   : undefined;
 
-Deno.serve({ port: config.PORT }, createApp(db, pool).fetch);
+const kv = await Deno.openKv();
+
+Deno.cron("purge old done tasks", "0 3 * * *", async () => {
+  const removed = await purgeOldDone(db, 30);
+  console.log(JSON.stringify({ job: "purge", removed }));
+});
+
+Deno.serve({ port: config.PORT }, createApp(db, pool, "./uploads", kv).fetch);
